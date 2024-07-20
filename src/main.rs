@@ -2,6 +2,8 @@ use reqwest::header::USER_AGENT;
 use scraper::{Html, Selector};
 use std::env;
 use std::fmt::Display;
+use std::fs::File;
+use std::io::prelude::*;
 
 use lettre::message::{header, Mailbox, MultiPart, SinglePart};
 use lettre::transport::smtp::authentication::Credentials;
@@ -14,6 +16,7 @@ const SEARCH_TEXT_KEY: &str = "SEARCH_TEXT";
 const CONTENT_TYPE_KEY: &str = "CONTENT_TYPE";
 const SELECTOR_KEY: &str = "SELECTOR";
 const DEBUG_KEY: &str = "DEBUG";
+const PREVENT_EMAIL_KEY: &str = "PREVENT_EMAIL";
 const SMTP_USER_KEY: &str = "SMTP_USER";
 const SMTP_PASS_KEY: &str = "SMTP_PASS";
 const SMTP_RELAY_KEY: &str = "SMTP_RELAY";
@@ -31,12 +34,16 @@ const EMAIL_FROM_KEY: &str = "EMAIL_FROM";
 async fn main() {
     dotenv::dotenv().ok();
     let is_debug = env::var(DEBUG_KEY).is_ok();
+    let prevent_email = env::var(PREVENT_EMAIL_KEY).is_ok();
 
     let config = load_config();
     let content = download_content(&config, is_debug).await;
 
     if is_debug {
         println!("Content {}", content);
+        let mut f = File::create("content.html").unwrap();
+        f.write_all(content.as_bytes()).unwrap();
+        f.sync_data().unwrap();
     }
 
     let matches = match config.content_type {
@@ -53,7 +60,7 @@ async fn main() {
     }
 
     if !matches.is_empty() {
-        email_result(&matches, &config, is_debug);
+        email_result(&matches, &config, is_debug, prevent_email);
     } else {
         println!("No matches");
     }
@@ -61,7 +68,7 @@ async fn main() {
     println!("Finished");
 }
 
-fn email_result(matches: &[String], config: &Config, is_debug: bool) {
+fn email_result(matches: &[String], config: &Config, is_debug: bool, prevent_email: bool) {
     let url = &config.url;
     let subject = format!("Found {} matche(s) for {}", matches.len(), url);
 
@@ -71,6 +78,15 @@ fn email_result(matches: &[String], config: &Config, is_debug: bool) {
         <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <style>
+            .container {
+                max-width: 440px;
+            }
+            .container img {
+                max-width: 440px;
+                height: unset;
+            }
+        </style>
     "#,
     );
 
@@ -79,10 +95,18 @@ fn email_result(matches: &[String], config: &Config, is_debug: bool) {
     html_body.push_str("</title>");
     html_body.push_str("</head>");
     html_body.push_str("<body>");
-    html_body.push_str(&format!("<a href=\"{}\">", url));
+    html_body.push_str(&format!("<h2><a class=\"url\" href=\"{}\">", url,));
     html_body.push_str(&url.to_string());
-    html_body.push_str("</a><br>");
-    html_body.push_str(&matches.join("<br/>"));
+    html_body.push_str("</h2></a><br>");
+    html_body.push_str("<table class=\"container\"><tbody>");
+    html_body.push_str(
+        &matches
+            .iter()
+            .map(|match_body| format!("<td>{}<td>", match_body))
+            .collect::<Vec<String>>()
+            .join("<br/>"),
+    );
+    html_body.push_str("</tbody></table>");
     html_body.push_str("</body>");
     html_body.push_str("</html>");
 
@@ -106,9 +130,15 @@ fn email_result(matches: &[String], config: &Config, is_debug: bool) {
         .unwrap();
 
     if is_debug {
-        println!("{}", html_body);
+        println!("Email {}", html_body);
+        let mut f = File::create("email.html").unwrap();
+        f.write_all(html_body.as_bytes()).unwrap();
+        f.sync_data().unwrap();
     }
-    send_email(&email);
+
+    if !prevent_email {
+        send_email(&email);
+    }
 }
 
 fn email_error(error: &str, config: &Config) {
