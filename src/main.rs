@@ -3,6 +3,7 @@ use std::fmt::Display;
 use std::fs::{self, remove_file, File};
 use std::io::prelude::*;
 use std::path::Path;
+use std::str::FromStr;
 
 use chrono::{prelude::*, Duration};
 use scraper::{Html, Selector};
@@ -14,19 +15,33 @@ use lettre::{Message, SmtpTransport, Transport};
 use reqwest::header::USER_AGENT;
 use reqwest::{self, Url};
 
+use derive_builder::Builder;
+
+use serde::Serialize;
+
 const TARGET_URL_KEY: &str = "TARGET_URL";
 const SEARCH_TEXT_KEY: &str = "SEARCH_TEXT";
 const CONTENT_TYPE_KEY: &str = "CONTENT_TYPE";
+const NOTIFICATION_TYPE_KEY: &str = "NOTIFICATION_TYPE";
 const SELECTOR_KEY: &str = "SELECTOR";
+
 const DEBUG_KEY: &str = "DEBUG";
 const PREVENT_EMAIL_KEY: &str = "PREVENT_EMAIL";
+const PREVENT_MESSAGE_KEY: &str = "PREVENT_MESSAGE";
+
 const SMTP_USER_KEY: &str = "SMTP_USER";
 const SMTP_PASS_KEY: &str = "SMTP_PASS";
 const SMTP_RELAY_KEY: &str = "SMTP_RELAY";
+
 const EMAIL_TO_KEY: &str = "EMAIL_TO";
 const EMAIL_FROM_KEY: &str = "EMAIL_FROM";
 const EMAIL_MAX_PER_INTERVAL_KEY: &str = "EMAIL_MAX_PER_INTERVAL";
 const EMAIL_INTERVAL_S_KEY: &str = "EMAIL_INTERVAL_S";
+
+const SIGNAL_URL_KEY: &str = "SIGNAL_URL";
+const SIGNAL_SENDER_KEY: &str = "SIGNAL_SENDER";
+const SIGNAL_RECIPIENTS_KEY: &str = "SIGNAL_RECIPIENTS";
+const SIGNAL_MESSAGE_PREFIX_KEY: &str = "SIGNAL_MESSAGE_PREFIX";
 
 // Expansions:
 // regex
@@ -39,10 +54,9 @@ const EMAIL_INTERVAL_S_KEY: &str = "EMAIL_INTERVAL_S";
 async fn main() {
     dotenv::dotenv().ok();
     let is_debug = env::var(DEBUG_KEY).is_ok();
-    if is_debug {
+    if is_debug && !Path::new("tmp").exists() {
         fs::create_dir("tmp").expect("can't create debug dir");
     }
-    let prevent_email = env::var(PREVENT_EMAIL_KEY).is_ok();
 
     let config = load_config();
     let content = download_content(&config, is_debug).await;
@@ -60,7 +74,7 @@ async fn main() {
     };
 
     if is_debug {
-        println!("Found {} matche(s)", matches.len());
+        println!("Found {} match(es)", matches.len());
         println!("\nResults");
         for result in &matches {
             println!("\n{}\n", result);
@@ -71,11 +85,119 @@ async fn main() {
 
     if !has_matches {
         println!("No matches");
-    } else if check_last_send_time(&config, is_debug).unwrap_or(false) {
-        email_result(&matches, &config, is_debug, prevent_email);
     }
 
+    if !check_last_send_time(&config, is_debug).unwrap_or(false) {
+        println!("Sent recent message or passed threshold");
+        return;
+    }
+
+    let tasks = config
+        .notification_types
+        .clone()
+        .into_iter()
+        .map(|notif_type| {
+            let matches = matches.clone();
+            let is_debug = is_debug.clone();
+            let config = config.clone();
+            match notif_type {
+                NotificationType::Email => tokio::spawn(async move {
+                    email_result(
+                        &matches,
+                        &config,
+                        is_debug,
+                        env::var(PREVENT_EMAIL_KEY).is_ok(),
+                    )
+                }),
+                NotificationType::Signal => tokio::spawn(async move {
+                    message_to_signal_result(
+                        &matches,
+                        &config,
+                        is_debug,
+                        env::var(PREVENT_MESSAGE_KEY).is_ok(),
+                    )
+                    .await
+                    .ok();
+                }),
+            }
+        })
+        .collect::<Vec<tokio::task::JoinHandle<()>>>();
+
+    for task in tasks {
+        task.await.unwrap();
+    }
+
+    // else
     println!("Finished");
+}
+
+#[derive(Serialize, Builder)]
+struct SignalMessage<'a> {
+    text_mode: &'a str,
+    number: &'a str,
+    recipients: &'a Vec<String>,
+    message: &'a str,
+}
+
+async fn message_to_signal_result(
+    matches: &[String],
+    config: &Config,
+    is_debug: bool,
+    prevent_message: bool,
+) -> reqwest::Result<()> {
+    let count_of_matches = matches.len();
+
+    let text_mode = "styled";
+    let number = config.signal_sender.as_ref().unwrap();
+    let recipients = &config.signal_recipients;
+    let message = format!(
+        "{}Found {} match(es) at {}",
+        config.signal_message.as_ref().unwrap_or(&String::new()),
+        count_of_matches,
+        config.url
+    );
+
+    let new_message = SignalMessageBuilder::default()
+        .text_mode(&text_mode)
+        .message(&message)
+        .recipients(recipients)
+        .number(number)
+        .message(&message)
+        .build()
+        .expect("Unable to build Signal message");
+
+    if is_debug {
+        println!("{}", serde_json::to_string(&new_message).unwrap());
+    }
+
+    //todo: load bytes for image?
+    // let messages = matches
+    //     .iter()
+    //     .enumerate()
+    //     .map(|(i, entry)| format!("Match *{}* of *{}*\n{}", i, count_of_matches, entry))
+    //     .collect::<Vec<String>>();
+
+    if prevent_message {
+        println!(
+            "PREVENT_MESSAGE set - not sending message\n{}\n",
+            serde_json::to_string_pretty(&new_message).unwrap()
+        );
+        return Ok(());
+    }
+
+    let client = reqwest::Client::new();
+
+    let result = client
+        .post(config.signal_url.as_ref().unwrap().to_owned())
+        .body(serde_json::to_string(&new_message).expect("Error stringifying SignalMessage"))
+        .send()
+        .await?;
+
+    if is_debug {
+        println!("{:?}", result);
+    }
+
+    Ok(())
 }
 
 const DEFAULT_EMAIL_INTERVAL: u32 = 60 * 5; //5 minutes
@@ -121,8 +243,6 @@ fn check_last_send_time(config: &Config, is_debug: bool) -> std::io::Result<bool
         })
         .unwrap();
 
-    println!("{:?}", parts);
-
     let last_send_time =
         DateTime::from_timestamp(last_send_time_seconds, 0).expect("Unable to create DateTime");
 
@@ -137,14 +257,14 @@ fn check_last_send_time(config: &Config, is_debug: bool) -> std::io::Result<bool
 
     if is_total_lower_than_threshold {
         save_last_send_time(&filename, total_send_count + 1)?;
-        println!("sent {} out of {} emails", total_send_count, max_sent);
+        println!("sent {} out of {} notifs", total_send_count, max_sent);
         Ok(true)
     } else if is_last_send_outside_interval {
         save_last_send_time(&filename, 1)?;
         println!("last sent more than {}s ago", email_interval);
         Ok(true)
     } else {
-        println!("not sending email");
+        println!("not sending notif");
         Ok(false)
     }
 }
@@ -198,8 +318,8 @@ fn email_result(matches: &[String], config: &Config, is_debug: bool, prevent_ema
     html_body.push_str("</html>");
 
     let email = Message::builder()
-        .from(config.email_from.clone())
-        .to(config.email_to.clone())
+        .from(config.email_from.as_ref().unwrap().clone())
+        .to(config.email_to.as_ref().unwrap().clone())
         .subject(subject)
         .multipart(
             MultiPart::alternative()
@@ -226,14 +346,14 @@ fn email_result(matches: &[String], config: &Config, is_debug: bool, prevent_ema
     if !prevent_email {
         send_email(&email);
     } else {
-        println!("PREVENT_EMAIL set - not sending email\n\n{}", html_body);
+        println!("PREVENT_EMAIL set - not sending email\n{}\n", html_body);
     }
 }
 
 fn email_error(error: &str, config: &Config) {
     let email = Message::builder()
-        .from(config.email_from.clone())
-        .to(config.email_to.clone())
+        .from(config.email_from.as_ref().unwrap().clone())
+        .to(config.email_to.as_ref().unwrap().clone())
         .subject(format!("Error polling site {}", config.url))
         .body(format!("Error: \n{}", error))
         .unwrap();
@@ -353,13 +473,22 @@ async fn download_content(config: &Config, is_debug: bool) -> String {
     }
 }
 
+#[derive(Builder, Clone)]
 struct Config {
     content_type: ContentType,
     url: Url,
     search_terms: Option<Vec<String>>,
     selector: Option<String>,
-    email_to: Mailbox,
-    email_from: Mailbox,
+
+    email_to: Option<Mailbox>,
+    email_from: Option<Mailbox>,
+
+    signal_url: Option<Url>,
+    signal_message: Option<String>,
+    signal_recipients: Vec<String>,
+    signal_sender: Option<String>,
+
+    notification_types: Vec<NotificationType>,
 }
 
 fn load_config() -> Config {
@@ -394,33 +523,78 @@ fn load_config() -> Config {
         }
     };
 
-    let email_to_string =
-        env::var(EMAIL_TO_KEY).expect("Need EMAIL_TO user email: 'User <user@example.com>'");
-    let email_to = email_to_string
-        .parse::<Mailbox>()
-        .expect("Need user of form: 'User <user@example.com>'");
+    let mut config_builder = ConfigBuilder::default();
+    config_builder
+        .search_terms(search_terms)
+        .selector(selector)
+        .content_type(content_type)
+        .email_from(None)
+        .email_to(None)
+        .url(url);
 
-    let email_from_string =
-        env::var(EMAIL_FROM_KEY).expect("Need EMAIL_FROM user email: 'App Name <app@example.com>'");
-    let email_from = email_from_string
-        .parse::<Mailbox>()
-        .expect("Need user of form: 'App Name <app@example.com>'");
+    let notification_type_string = env::var(NOTIFICATION_TYPE_KEY)
+        .expect("Need NOTIFICATION_TYPE with comma separated types e.g signal,email");
+    let notification_types = notification_type_string
+        .split(",")
+        .map(|entry| NotificationType::try_from(entry).expect("Unknown NOTIFICATION_TYPE"))
+        .collect::<Vec<NotificationType>>();
 
-    // doing this upfront so we can exit early
-    let _ = env::var(SMTP_RELAY_KEY).expect("Need SMTP relay url");
-    let _ = env::var(SMTP_USER_KEY).expect("Need SMTP username");
-    let _ = env::var(SMTP_PASS_KEY).expect("Need SMTP password");
+    if notification_types.contains(&NotificationType::Email) {
+        println!("Config for Email notifs found");
 
-    Config {
-        url,
-        search_terms,
-        content_type,
-        selector,
-        email_from,
-        email_to,
+        let email_to_string =
+            env::var(EMAIL_TO_KEY).expect("Need EMAIL_TO user email: 'User <user@example.com>'");
+        let email_to = email_to_string
+            .parse::<Mailbox>()
+            .expect("Need user of form: 'User <user@example.com>'");
+
+        let email_from_string = env::var(EMAIL_FROM_KEY)
+            .expect("Need EMAIL_FROM user email: 'App Name <app@example.com>'");
+        let email_from = email_from_string
+            .parse::<Mailbox>()
+            .expect("Need user of form: 'App Name <app@example.com>'");
+
+        // doing this upfront so we can exit early
+        let _ = env::var(SMTP_RELAY_KEY).expect("Need SMTP relay url");
+        let _ = env::var(SMTP_USER_KEY).expect("Need SMTP username");
+        let _ = env::var(SMTP_PASS_KEY).expect("Need SMTP password");
+
+        config_builder
+            .email_to(Some(email_to))
+            .email_from(Some(email_from));
     }
+
+    if notification_types.contains(&NotificationType::Signal) {
+        println!("Config for Signal notifs found");
+
+        let signal_url_string = env::var(SIGNAL_URL_KEY).expect("Need SIGNAL_URL to send notifs");
+
+        let signal_url = Url::from_str(&signal_url_string).expect("Error parsing signal URL");
+
+        let signal_message_prefix = env::var(SIGNAL_MESSAGE_PREFIX_KEY).ok();
+
+        let signal_recipients = env::var(SIGNAL_RECIPIENTS_KEY)
+            .expect("Need SIGNAL_RECIPIENTS to send notifs")
+            .split(",")
+            .map(|val| val.to_string())
+            .collect::<Vec<String>>();
+
+        let signal_sender = env::var(SIGNAL_SENDER_KEY).expect("Need SIGNAL_SEND to send notifs");
+
+        config_builder
+            .signal_message(signal_message_prefix)
+            .signal_url(Some(signal_url))
+            .signal_recipients(signal_recipients)
+            .signal_sender(Some(signal_sender));
+    }
+
+    config_builder
+        .notification_types(notification_types)
+        .build()
+        .expect("Unable to build config")
 }
 
+#[derive(Clone)]
 enum ContentType {
     Html,
     Text,
@@ -445,5 +619,33 @@ impl Display for ContentType {
             ContentType::Text => "text",
         };
         f.write_fmt(format_args!("{content_type_string}"))
+    }
+}
+
+#[derive(Debug, PartialEq, Clone)]
+enum NotificationType {
+    Signal,
+    Email,
+}
+
+impl TryFrom<&str> for NotificationType {
+    type Error = &'static str;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value.to_lowercase().trim() {
+            "signal" => Ok(NotificationType::Signal),
+            "email" => Ok(NotificationType::Email),
+            _ => Err("Unknown notification type"),
+        }
+    }
+}
+
+impl Display for NotificationType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let notification_type_string = match self {
+            NotificationType::Email => "Email",
+            NotificationType::Signal => "Signal",
+        };
+        f.write_fmt(format_args!("{}", notification_type_string))
     }
 }
