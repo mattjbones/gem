@@ -1,14 +1,17 @@
-use reqwest::header::USER_AGENT;
-use scraper::{Html, Selector};
 use std::env;
 use std::fmt::Display;
-use std::fs::File;
+use std::fs::{self, remove_file, File};
 use std::io::prelude::*;
+use std::path::Path;
+
+use chrono::{prelude::*, Duration};
+use scraper::{Html, Selector};
 
 use lettre::message::{header, Mailbox, MultiPart, SinglePart};
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{Message, SmtpTransport, Transport};
 
+use reqwest::header::USER_AGENT;
 use reqwest::{self, Url};
 
 const TARGET_URL_KEY: &str = "TARGET_URL";
@@ -22,6 +25,8 @@ const SMTP_PASS_KEY: &str = "SMTP_PASS";
 const SMTP_RELAY_KEY: &str = "SMTP_RELAY";
 const EMAIL_TO_KEY: &str = "EMAIL_TO";
 const EMAIL_FROM_KEY: &str = "EMAIL_FROM";
+const EMAIL_MAX_PER_INTERVAL_KEY: &str = "EMAIL_MAX_PER_INTERVAL";
+const EMAIL_INTERVAL_S_KEY: &str = "EMAIL_INTERVAL_S";
 
 // Expansions:
 // regex
@@ -34,6 +39,9 @@ const EMAIL_FROM_KEY: &str = "EMAIL_FROM";
 async fn main() {
     dotenv::dotenv().ok();
     let is_debug = env::var(DEBUG_KEY).is_ok();
+    if is_debug {
+        fs::create_dir("tmp").expect("can't create debug dir");
+    }
     let prevent_email = env::var(PREVENT_EMAIL_KEY).is_ok();
 
     let config = load_config();
@@ -41,7 +49,7 @@ async fn main() {
 
     if is_debug {
         println!("Content {}", content);
-        let mut f = File::create("content.html").unwrap();
+        let mut f = File::create("tmp/content.html").unwrap();
         f.write_all(content.as_bytes()).unwrap();
         f.sync_data().unwrap();
     }
@@ -59,18 +67,97 @@ async fn main() {
         }
     }
 
-    if !matches.is_empty() {
-        email_result(&matches, &config, is_debug, prevent_email);
-    } else {
+    let has_matches = !matches.is_empty();
+
+    if !has_matches {
         println!("No matches");
+    } else if check_last_send_time(&config, is_debug).unwrap_or(false) {
+        email_result(&matches, &config, is_debug, prevent_email);
     }
 
     println!("Finished");
 }
 
+const DEFAULT_EMAIL_INTERVAL: u32 = 60 * 5; //5 minutes
+const DEFAULT_MAX_SEND: u8 = 3;
+fn check_last_send_time(config: &Config, is_debug: bool) -> std::io::Result<bool> {
+    let email_interval = env::var(EMAIL_INTERVAL_S_KEY).map_or(DEFAULT_EMAIL_INTERVAL, |val| {
+        val.parse::<u32>()
+            .expect("Invalid number for email interval")
+    });
+    let max_sent = env::var(EMAIL_MAX_PER_INTERVAL_KEY).map_or(DEFAULT_MAX_SEND, |val| {
+        val.parse::<u8>().expect("Invalid number for max email")
+    });
+
+    let filename = format!("last_checked-{}", config.url.domain().or(Some("")).unwrap());
+
+    if is_debug {
+        println!("{}", &filename);
+    }
+
+    if !Path::new(&filename).exists() {
+        save_last_send_time(&filename, 1)?;
+        return Ok(true);
+    }
+
+    // load file
+    let mut file = File::open(&filename)?;
+    let mut contents = String::new();
+    file.read_to_string(&mut contents)?;
+    let parts = contents.split("|").collect::<Vec<&str>>();
+
+    if parts.len() != 2 {
+        // can't parse file so log it, delete and send email
+        println!("Unexpected format {}", contents);
+        remove_file(&filename)?;
+        return Ok(true);
+    }
+
+    let last_send_time_seconds = parts
+        .get(0)
+        .map(|val| {
+            val.parse::<i64>()
+                .expect(&format!("Unable to parse timestamp to int {}", val))
+        })
+        .unwrap();
+
+    println!("{:?}", parts);
+
+    let last_send_time =
+        DateTime::from_timestamp(last_send_time_seconds, 0).expect("Unable to create DateTime");
+
+    let total_send_count = parts
+        .get(1)
+        .map(|val| val.parse::<u8>().expect("Unable to parse count"))
+        .unwrap();
+
+    let is_last_send_outside_interval =
+        Utc::now() > last_send_time + Duration::seconds(email_interval.into());
+    let is_total_lower_than_threshold = total_send_count < max_sent;
+
+    if is_total_lower_than_threshold {
+        save_last_send_time(&filename, total_send_count + 1)?;
+        println!("sent {} out of {} emails", total_send_count, max_sent);
+        Ok(true)
+    } else if is_last_send_outside_interval {
+        save_last_send_time(&filename, 1)?;
+        println!("last sent more than {}s ago", email_interval);
+        Ok(true)
+    } else {
+        println!("not sending email");
+        Ok(false)
+    }
+}
+
+fn save_last_send_time(filename: &str, count: u8) -> std::io::Result<bool> {
+    let mut file = File::create(filename)?;
+    file.write_all(format!("{}|{}", Utc::now().timestamp(), count).as_bytes())?;
+    Ok(true)
+}
+
 fn email_result(matches: &[String], config: &Config, is_debug: bool, prevent_email: bool) {
     let url = &config.url;
-    let subject = format!("Found {} matche(s) for {}", matches.len(), url);
+    let subject = format!("Found {} match(es) for {}", matches.len(), url);
 
     let mut html_body = String::from(
         r#"<!DOCTYPE html>
@@ -131,13 +218,15 @@ fn email_result(matches: &[String], config: &Config, is_debug: bool, prevent_ema
 
     if is_debug {
         println!("Email {}", html_body);
-        let mut f = File::create("email.html").unwrap();
+        let mut f = File::create("tmp/email.html").unwrap();
         f.write_all(html_body.as_bytes()).unwrap();
         f.sync_data().unwrap();
     }
 
     if !prevent_email {
         send_email(&email);
+    } else {
+        println!("PREVENT_EMAIL set - not sending email\n\n{}", html_body);
     }
 }
 

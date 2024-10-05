@@ -1,2 +1,4 @@
 /target
 .env
+last_checked*
+tmp
