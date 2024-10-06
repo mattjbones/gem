@@ -13,7 +13,7 @@ use lettre::transport::smtp::authentication::Credentials;
 use lettre::{Message, SmtpTransport, Transport};
 
 use reqwest::header::USER_AGENT;
-use reqwest::{self, Url};
+use reqwest::{self, StatusCode, Url};
 
 use derive_builder::Builder;
 
@@ -22,8 +22,12 @@ use serde::Serialize;
 const TARGET_URL_KEY: &str = "TARGET_URL";
 const SEARCH_TEXT_KEY: &str = "SEARCH_TEXT";
 const CONTENT_TYPE_KEY: &str = "CONTENT_TYPE";
-const NOTIFICATION_TYPE_KEY: &str = "NOTIFICATION_TYPE";
 const SELECTOR_KEY: &str = "SELECTOR";
+
+const NOTIFICATION_TYPE_KEY: &str = "NOTIFICATION_TYPE";
+const NOTIFICATION_MAX_PER_INTERVAL_KEY: &str = "NOTIFICATION_MAX_PER_INTERVAL";
+const NOTIFICATION_INTERVAL_S_KEY: &str = "NOTIFICATION_INTERVAL_S";
+const NOTIFICATION_WRITE_DIR_KEY: &str = "NOTIFICATION_WRITE_DIR";
 
 const DEBUG_KEY: &str = "DEBUG";
 const PREVENT_EMAIL_KEY: &str = "PREVENT_EMAIL";
@@ -35,8 +39,6 @@ const SMTP_RELAY_KEY: &str = "SMTP_RELAY";
 
 const EMAIL_TO_KEY: &str = "EMAIL_TO";
 const EMAIL_FROM_KEY: &str = "EMAIL_FROM";
-const EMAIL_MAX_PER_INTERVAL_KEY: &str = "EMAIL_MAX_PER_INTERVAL";
-const EMAIL_INTERVAL_S_KEY: &str = "EMAIL_INTERVAL_S";
 
 const SIGNAL_URL_KEY: &str = "SIGNAL_URL";
 const SIGNAL_SENDER_KEY: &str = "SIGNAL_SENDER";
@@ -85,12 +87,15 @@ async fn main() {
 
     if !has_matches {
         println!("No matches");
+        return;
     }
 
     if !check_last_send_time(&config, is_debug).unwrap_or(false) {
         println!("Sent recent message or passed threshold");
         return;
     }
+
+    println!("Notifying...");
 
     let tasks = config
         .notification_types
@@ -193,25 +198,37 @@ async fn message_to_signal_result(
         .send()
         .await?;
 
-    if is_debug {
-        println!("{:?}", result);
+    println!("Signal status {}", result.status());
+
+    if is_debug || result.status() != StatusCode::CREATED {
+        println!("Request: {}", serde_json::to_string(&new_message).unwrap());
+        println!("Response: {:?}", result);
     }
 
     Ok(())
 }
 
-const DEFAULT_EMAIL_INTERVAL: u32 = 60 * 5; //5 minutes
+const DEFAULT_NOTIFICATION_INTERVAL: u32 = 60 * 5; //5 minutes
 const DEFAULT_MAX_SEND: u8 = 3;
+const DEFAULT_NOTIFICATION_WRITE_DIR: &str = "./";
 fn check_last_send_time(config: &Config, is_debug: bool) -> std::io::Result<bool> {
-    let email_interval = env::var(EMAIL_INTERVAL_S_KEY).map_or(DEFAULT_EMAIL_INTERVAL, |val| {
-        val.parse::<u32>()
-            .expect("Invalid number for email interval")
-    });
-    let max_sent = env::var(EMAIL_MAX_PER_INTERVAL_KEY).map_or(DEFAULT_MAX_SEND, |val| {
-        val.parse::<u8>().expect("Invalid number for max email")
+    let notif_interval =
+        env::var(NOTIFICATION_INTERVAL_S_KEY).map_or(DEFAULT_NOTIFICATION_INTERVAL, |val| {
+            val.parse::<u32>()
+                .expect("Invalid number for notif interval")
+        });
+    let max_sent = env::var(NOTIFICATION_MAX_PER_INTERVAL_KEY).map_or(DEFAULT_MAX_SEND, |val| {
+        val.parse::<u8>().expect("Invalid number for max notif")
     });
 
-    let filename = format!("last_checked-{}", config.url.domain().or(Some("")).unwrap());
+    let notification_write_dir =
+        env::var(NOTIFICATION_WRITE_DIR_KEY).unwrap_or(DEFAULT_NOTIFICATION_WRITE_DIR.to_string());
+
+    let filename = format!(
+        "{}last_checked-{}",
+        notification_write_dir,
+        config.url.domain().or(Some("")).unwrap()
+    );
 
     if is_debug {
         println!("{}", &filename);
@@ -219,6 +236,7 @@ fn check_last_send_time(config: &Config, is_debug: bool) -> std::io::Result<bool
 
     if !Path::new(&filename).exists() {
         save_last_send_time(&filename, 1)?;
+        println!("Creating last send time");
         return Ok(true);
     }
 
@@ -252,7 +270,7 @@ fn check_last_send_time(config: &Config, is_debug: bool) -> std::io::Result<bool
         .unwrap();
 
     let is_last_send_outside_interval =
-        Utc::now() > last_send_time + Duration::seconds(email_interval.into());
+        Utc::now() > last_send_time + Duration::seconds(notif_interval.into());
     let is_total_lower_than_threshold = total_send_count < max_sent;
 
     if is_total_lower_than_threshold {
@@ -261,7 +279,7 @@ fn check_last_send_time(config: &Config, is_debug: bool) -> std::io::Result<bool
         Ok(true)
     } else if is_last_send_outside_interval {
         save_last_send_time(&filename, 1)?;
-        println!("last sent more than {}s ago", email_interval);
+        println!("last sent more than {}s ago", notif_interval);
         Ok(true)
     } else {
         println!("not sending notif");
